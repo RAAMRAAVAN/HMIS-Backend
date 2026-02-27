@@ -16,6 +16,7 @@ const allowedOrigins = (process.env.CORS_ORIGINS || "http://localhost:3001,http:
   .map((origin) => origin.trim())
   .filter(Boolean);
 const privateNetworkOriginRegex = /^https?:\/\/(localhost|127\.0\.0\.1|10\.|192\.168\.|172\.(1[6-9]|2\d|3[0-1])\.)/i;
+const tunnelOriginRegex = /^https:\/\/[a-z0-9-]+\.(loca\.lt|ngrok-free\.app|trycloudflare\.com|lhr\.life|localhost\.run)$/i;
 
 // Middlewares
 // CORS config
@@ -24,8 +25,9 @@ app.use(cors({
     const normalizedOrigin = origin?.trim();
     const isAllowedOrigin = normalizedOrigin && allowedOrigins.includes(normalizedOrigin);
     const isPrivateNetworkOrigin = normalizedOrigin && privateNetworkOriginRegex.test(normalizedOrigin);
+    const isTunnelOrigin = normalizedOrigin && tunnelOriginRegex.test(normalizedOrigin);
 
-    if (!normalizedOrigin || isAllowedOrigin || isPrivateNetworkOrigin) {
+    if (!normalizedOrigin || isAllowedOrigin || isPrivateNetworkOrigin || isTunnelOrigin) {
       return callback(null, true);
     }
     return callback(new Error("Not allowed by CORS"));
