@@ -14,12 +14,17 @@ const allowedOrigins = (process.env.CORS_ORIGINS || "http://localhost:3001,http:
   .split(",")
   .map((origin) => origin.trim())
   .filter(Boolean);
+const privateNetworkOriginRegex = /^https?:\/\/(localhost|127\.0\.0\.1|10\.|192\.168\.|172\.(1[6-9]|2\d|3[0-1])\.)/i;
 
 // Middlewares
 // CORS config
 app.use(cors({
   origin: (origin, callback) => {
-    if (!origin || allowedOrigins.includes(origin)) {
+    const normalizedOrigin = origin?.trim();
+    const isAllowedOrigin = normalizedOrigin && allowedOrigins.includes(normalizedOrigin);
+    const isPrivateNetworkOrigin = normalizedOrigin && privateNetworkOriginRegex.test(normalizedOrigin);
+
+    if (!normalizedOrigin || isAllowedOrigin || isPrivateNetworkOrigin) {
       return callback(null, true);
     }
     return callback(new Error("Not allowed by CORS"));
@@ -46,7 +51,8 @@ app.get("/", (req, res) => {
 
 // Start server
 const PORT = process.env.PORT || 5000;
+const HOST = process.env.HOST || "0.0.0.0";
 
-httpServer.listen(PORT, () => {
-  console.log(`🚀 Server + Socket running on port ${PORT}`);
+httpServer.listen(PORT, HOST, () => {
+  console.log(`🚀 Server + Socket running on http://${HOST}:${PORT}`);
 });
