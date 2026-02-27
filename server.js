@@ -6,6 +6,7 @@ import { initSocket } from "./socket.js";
 import usersRoutes from "./routes/users.routes.js";
 import otRoutes from "./routes/ot.routes.js";
 import cookieParser from "cookie-parser";
+import path from "path";
 
 dotenv.config();
 
@@ -33,6 +34,7 @@ app.use(cors({
 }));
 app.use(express.json());
 app.use(cookieParser());
+app.use("/uploads", express.static(path.join(process.cwd(), "uploads")));
 
 // Create HTTP server (socket will attach to this)
 const httpServer = createServer(app);

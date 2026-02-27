@@ -1,5 +1,6 @@
 import { Server } from "socket.io";
-import { createMessage } from "./models/whatsappmessage.model.js";
+import { createMessage, updateMessageStatus } from "./models/whatsappmessage.model.js";
+import { serializeChatBody } from "./utils/chatMessageFormat.js";
 
 let io = null;
 
@@ -65,44 +66,115 @@ export function initSocket(httpServer) {
       const from = data.fromEmail || data.fromUserEmail || data.from || data.fromUserId || registeredUser;
       const to = data.toEmail || data.toUserEmail || data.to || data.toUserId || data.receiverId;
       const text = data.text || data.message || data.body;
+      const messageType = data.messageType === "file" ? "file" : "text";
+      const file = data.file || null;
 
-      if (!from || !to || !text) {
+      if (!from || !to || (!text && !file)) {
         socket.emit("socket_error", {
-          message: "Invalid privateMessage payload. from, to and text are required",
+          message: "Invalid privateMessage payload. from, to and (text or file) are required",
         });
         return;
       }
 
       const fromRoom = from.toString().toLowerCase();
       const toRoom = to.toString().toLowerCase();
-      const payload = {
-        from: fromRoom,
-        to: toRoom,
-        text,
-        conversationId: data.conversationId || null,
-        createdAt: new Date().toISOString(),
-      };
-
-      io.to(toRoom).emit("privateMessage", payload);
-      if (fromRoom !== toRoom) {
-        io.to(fromRoom).emit("privateMessage", payload);
-      }
-
       try {
         const senderId = Number(data.fromID);
         const receiverId = Number(data.toID);
+        const receiverRoomSize = io.sockets.adapter.rooms.get(toRoom)?.size || 0;
+        const initialStatus = receiverRoomSize > 0 ? "delivered" : "sent";
 
         const savedMessage = await createMessage({
           conversationId: data.conversationId || null,
           senderId: Number.isNaN(senderId) ? null : senderId,
           receiverID: Number.isNaN(receiverId) ? null : receiverId,
-          body: text
+          status: initialStatus,
+          isRead: false,
+          body: serializeChatBody({
+            text: text || file?.originalName || "",
+            messageType,
+            file,
+          })
         });
 
-        io.to(fromRoom).emit("privateMessageSaved", { id: savedMessage.id, ...payload });
+        const payload = {
+          id: savedMessage.id,
+          from: fromRoom,
+          to: toRoom,
+          text: text || file?.originalName || "",
+          messageType,
+          file,
+          status: initialStatus,
+          isRead: false,
+          conversationId: data.conversationId || null,
+          createdAt: savedMessage.created_at || new Date().toISOString(),
+        };
+
+        io.to(toRoom).emit("privateMessage", payload);
+        if (fromRoom !== toRoom) {
+          io.to(fromRoom).emit("privateMessage", payload);
+        }
+
+        if (initialStatus === "delivered") {
+          io.to(fromRoom).emit("messageStatus", {
+            messageId: savedMessage.id,
+            status: "delivered",
+            updatedAt: new Date().toISOString(),
+          });
+        }
       } catch (err) {
         console.error("❌ Error saving private message:", err.message);
         socket.emit("socket_error", { message: "Message not saved", error: err.message });
+      }
+    });
+
+    socket.on("messageDelivered", async (data) => {
+      try {
+        const messageId = data?.messageId;
+        const from = String(data?.from || "").toLowerCase();
+        if (!messageId || !from) return;
+
+        const updated = await updateMessageStatus({
+          messageId,
+          status: "delivered",
+          isRead: false,
+        });
+
+        if (!updated) return;
+
+        io.to(from).emit("messageStatus", {
+          messageId,
+          status: updated.is_read ? "read" : "delivered",
+          updatedAt: new Date().toISOString(),
+        });
+      } catch (error) {
+        console.error("❌ Error updating delivered status:", error.message);
+      }
+    });
+
+    socket.on("messageSeen", async (data) => {
+      try {
+        const messageId = data?.messageId;
+        const from = String(data?.from || "").toLowerCase();
+        if (!messageId) return;
+
+        const updated = await updateMessageStatus({
+          messageId,
+          status: "read",
+          isRead: true,
+        });
+
+        if (!updated) return;
+
+        if (from) {
+          io.to(from).emit("messageStatus", {
+            messageId,
+            status: "read",
+            updatedAt: new Date().toISOString(),
+          });
+        }
+      } catch (error) {
+        console.error("❌ Error updating seen status:", error.message);
       }
     });
 

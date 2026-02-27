@@ -8,6 +8,10 @@ import pool from "../db.js";
 import bcrypt from "bcrypt";
 import { v4 as uuidv4 } from "uuid";
 import { redis } from "../src/config/redis.js";
+import fs from "fs/promises";
+import path from "path";
+import { parseChatBody } from "../utils/chatMessageFormat.js";
+import { getIO } from "../socket.js";
 
 async function getSessionUserFromRequest(req) {
   const sessionId = req.cookies.sessionId;
@@ -21,6 +25,27 @@ async function getSessionUserFromRequest(req) {
   } catch {
     return null;
   }
+}
+
+function getFileKind(mimeType = "") {
+  if (mimeType.startsWith("image/")) return "image";
+  if (mimeType.startsWith("video/")) return "video";
+  return "document";
+}
+
+function buildChatKey({ fromID, toID, fromEmail, toEmail }) {
+  const idA = Number(fromID);
+  const idB = Number(toID);
+
+  if (!Number.isNaN(idA) && !Number.isNaN(idB) && idA > 0 && idB > 0) {
+    const [minId, maxId] = [idA, idB].sort((a, b) => a - b);
+    return `user_${minId}_user_${maxId}`;
+  }
+
+  const emailA = String(fromEmail || "").toLowerCase().replace(/[^a-z0-9@._-]/g, "_");
+  const emailB = String(toEmail || "").toLowerCase().replace(/[^a-z0-9@._-]/g, "_");
+  const [minEmail, maxEmail] = [emailA, emailB].sort();
+  return `email_${minEmail}__${maxEmail}`;
 }
 
 async function updateUserPassword(userId, hashedPassword) {
@@ -202,6 +227,7 @@ export const getChatHistory = async (req, res) => {
         m.receiver_id,
         m.body,
         m.created_at,
+        m.status,
         COALESCE(m.is_read, false) AS is_read,
         LOWER(s.email) AS sender_email,
         LOWER(r.email) AS receiver_email
@@ -217,16 +243,23 @@ export const getChatHistory = async (req, res) => {
       [sessionUser.id, otherUserId]
     );
 
-    const data = result.rows.map((row) => ({
-      id: row.id,
-      from: row.sender_email,
-      to: row.receiver_email,
-      text: row.body,
-      timestamp: row.created_at,
-      fromID: row.sender_id,
-      toID: row.receiver_id,
-      isRead: row.is_read,
-    }));
+    const data = result.rows.map((row) => {
+      const parsedBody = parseChatBody(row.body);
+
+      return {
+        id: row.id,
+        from: row.sender_email,
+        to: row.receiver_email,
+        text: parsedBody.text,
+        messageType: parsedBody.messageType,
+        file: parsedBody.file,
+        status: row.status || (row.is_read ? "read" : "sent"),
+        timestamp: row.created_at,
+        fromID: row.sender_id,
+        toID: row.receiver_id,
+        isRead: row.is_read,
+      };
+    });
 
     return res.json({ success: true, data });
   } catch (error) {
@@ -308,9 +341,91 @@ export const markChatAsRead = async (req, res) => {
       [otherUserId, sessionUser.id]
     );
 
+    if (updateResult.rowCount > 0) {
+      const senderResult = await pool.query(
+        `SELECT LOWER(email) AS email FROM users WHERE id = $1 LIMIT 1`,
+        [otherUserId]
+      );
+      const senderEmail = senderResult.rows?.[0]?.email;
+
+      if (senderEmail) {
+        const io = getIO();
+        updateResult.rows.forEach((row) => {
+          io.to(senderEmail).emit("messageStatus", {
+            messageId: row.id,
+            status: "read",
+            updatedAt: new Date().toISOString(),
+          });
+        });
+      }
+    }
+
     return res.json({ success: true, updated: updateResult.rowCount });
   } catch (error) {
     console.error("Mark chat read error:", error);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+
+export const uploadChatFile = async (req, res) => {
+  try {
+    const sessionUser = await getSessionUserFromRequest(req);
+    if (!sessionUser?.id) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ success: false, message: "File is required" });
+    }
+
+    const { fromID, toID, fromEmail, toEmail } = req.body;
+    const chatKey = buildChatKey({ fromID, toID, fromEmail, toEmail });
+
+    const uploadsBaseDir = path.join(process.cwd(), "uploads", "chats", chatKey);
+    const filesDir = path.join(uploadsBaseDir, "files");
+    await fs.mkdir(filesDir, { recursive: true });
+
+    const extension = path.extname(req.file.originalname || "") || "";
+    const storedName = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}${extension}`;
+    const absoluteFilePath = path.join(filesDir, storedName);
+    await fs.writeFile(absoluteFilePath, req.file.buffer);
+
+    const relativePath = `/uploads/chats/${chatKey}/files/${storedName}`;
+    const fileDetails = {
+      kind: getFileKind(req.file.mimetype || ""),
+      originalName: req.file.originalname,
+      storedName,
+      mimeType: req.file.mimetype,
+      size: req.file.size,
+      url: relativePath,
+    };
+
+    const metadataPath = path.join(uploadsBaseDir, "metadata.json");
+    let metadata = [];
+
+    try {
+      const existing = await fs.readFile(metadataPath, "utf-8");
+      metadata = JSON.parse(existing);
+      if (!Array.isArray(metadata)) metadata = [];
+    } catch {
+      metadata = [];
+    }
+
+    metadata.push({
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      senderId: Number(fromID) || null,
+      receiverId: Number(toID) || null,
+      senderEmail: String(fromEmail || "").toLowerCase(),
+      receiverEmail: String(toEmail || "").toLowerCase(),
+      uploadedAt: new Date().toISOString(),
+      ...fileDetails,
+    });
+
+    await fs.writeFile(metadataPath, JSON.stringify(metadata, null, 2), "utf-8");
+
+    return res.json({ success: true, file: fileDetails });
+  } catch (error) {
+    console.error("Chat file upload error:", error);
     return res.status(500).json({ success: false, message: "Server error" });
   }
 };
