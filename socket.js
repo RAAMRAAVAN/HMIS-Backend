@@ -22,16 +22,16 @@ export function initSocket(httpServer) {
     /**
      * USER REGISTRATION
      * client must emit:
-     * socket.emit("register", userID)
+     * socket.emit("register", userEmail)
      */
-    socket.on("register", (userID) => {
-      if (!userID) {
-        socket.emit("socket_error", { message: "userID is required for register" });
+    socket.on("register", (userEmail) => {
+      if (!userEmail) {
+        socket.emit("socket_error", { message: "userEmail is required for register" });
         return;
       }
 
-      const roomId = userID.toString();
-      console.log(`👤 User registered → user: ${userID}, socket: ${socket.id}`);
+      const roomId = userEmail.toString().toLowerCase();
+      console.log(`👤 User registered → user: ${roomId}, socket: ${socket.id}`);
       connectedUsers.set(socket.id, roomId);
 
       // Join user-specific room
@@ -61,9 +61,9 @@ export function initSocket(httpServer) {
      * 2️⃣ { fromUserId:"ram", toUserId:"maa", message:"hello" }
      */
     socket.on("privateMessage", async (data) => {
-      const registeredUserId = connectedUsers.get(socket.id);
-      const from = data.fromID || data.fromUserId || registeredUserId;
-      const to = data.toID || data.to || data.toUserId || data.receiverId;
+      const registeredUser = connectedUsers.get(socket.id);
+      const from = data.fromEmail || data.fromUserEmail || data.from || data.fromUserId || registeredUser;
+      const to = data.toEmail || data.toUserEmail || data.to || data.toUserId || data.receiverId;
       const text = data.text || data.message || data.body;
 
       if (!from || !to || !text) {
@@ -73,8 +73,8 @@ export function initSocket(httpServer) {
         return;
       }
 
-      const fromRoom = from.toString();
-      const toRoom = to.toString();
+      const fromRoom = from.toString().toLowerCase();
+      const toRoom = to.toString().toLowerCase();
       const payload = {
         from: fromRoom,
         to: toRoom,
@@ -89,8 +89,8 @@ export function initSocket(httpServer) {
       }
 
       try {
-        const senderId = Number(data.fromID ?? from);
-        const receiverId = Number(data.toID ?? to);
+        const senderId = Number(data.fromID);
+        const receiverId = Number(data.toID);
 
         const savedMessage = await createMessage({
           conversationId: data.conversationId || null,
