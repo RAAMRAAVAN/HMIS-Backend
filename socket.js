@@ -32,7 +32,10 @@ export function initSocket(httpServer) {
     cors: {
       origin: "*",
       methods: ["GET", "POST"]
-    }
+    },
+    pingInterval: 20000,
+    pingTimeout: 20000,
+    maxHttpBufferSize: 1e6,
   });
 
   io.on("connection", (socket) => {

@@ -7,6 +7,7 @@ import usersRoutes from "./routes/users.routes.js";
 import otRoutes from "./routes/ot.routes.js";
 import cookieParser from "cookie-parser";
 import path from "path";
+import { ensureDatabaseOptimizations } from "./utils/dbOptimization.js";
 
 dotenv.config();
 
@@ -34,9 +35,16 @@ app.use(cors({
   },
   credentials: true                 // ✅ allow cookies
 }));
-app.use(express.json());
+app.disable("x-powered-by");
+app.use(express.json({ limit: "1mb" }));
 app.use(cookieParser());
 app.use("/uploads", express.static(path.join(process.cwd(), "uploads")));
+
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  next();
+});
 
 // Create HTTP server (socket will attach to this)
 const httpServer = createServer(app);
@@ -57,6 +65,22 @@ app.get("/", (req, res) => {
 const PORT = process.env.PORT || 5000;
 const HOST = process.env.HOST || "0.0.0.0";
 
-httpServer.listen(PORT, HOST, () => {
-  console.log(`🚀 Server + Socket running on http://${HOST}:${PORT}`);
-});
+httpServer.requestTimeout = 30_000;
+httpServer.headersTimeout = 35_000;
+httpServer.keepAliveTimeout = 10_000;
+
+async function startServer() {
+  try {
+    await ensureDatabaseOptimizations();
+    console.log("✅ Database optimization checks complete");
+
+    httpServer.listen(PORT, HOST, () => {
+      console.log(`🚀 Server + Socket running on http://${HOST}:${PORT}`);
+    });
+  } catch (error) {
+    console.error("❌ Failed to start server:", error);
+    process.exit(1);
+  }
+}
+
+startServer();
