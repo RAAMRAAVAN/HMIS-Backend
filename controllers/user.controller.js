@@ -2,6 +2,7 @@ import {
   getAllUsersFromDB,
   createUserInDB,
   findUserByNameModel,
+  setUserOnlineStatus,
 } from "../models/user.model.js";
 import pool from "../db.js";
 
@@ -173,6 +174,23 @@ export async function login(req, res) {
 
 export const logout = async (req, res) => {
   try {
+    const sessionUser = await getSessionUserFromRequest(req);
+
+    if (sessionUser?.email || sessionUser?.name) {
+      const identifier = String(sessionUser.email || sessionUser.name).toLowerCase();
+      await setUserOnlineStatus({ identifier, isOnline: false });
+
+      try {
+        const io = getIO();
+        io.emit("presenceUpdate", {
+          identifier,
+          isOnline: false,
+          lastSeen: new Date().toISOString(),
+        });
+      } catch {
+      }
+    }
+
     const sessionId = req.cookies.sessionId;
     if (sessionId) await redis.del(`session:${sessionId}`);
     res.clearCookie("sessionId");

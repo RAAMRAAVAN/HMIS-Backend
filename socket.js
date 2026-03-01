@@ -1,6 +1,7 @@
 import { Server } from "socket.io";
 import { createMessage, updateMessageStatus } from "./models/whatsappmessage.model.js";
 import { serializeChatBody } from "./utils/chatMessageFormat.js";
+import { setUserOnlineStatus } from "./models/user.model.js";
 
 let io = null;
 
@@ -37,6 +38,16 @@ export function initSocket(httpServer) {
 
       // Join user-specific room
       socket.join(roomId);
+
+      setUserOnlineStatus({ identifier: roomId, isOnline: true }).catch((error) => {
+        console.error("❌ Failed to set user online:", error.message);
+      });
+
+      io.emit("presenceUpdate", {
+        identifier: roomId,
+        isOnline: true,
+        lastSeen: null,
+      });
     });
 
     /**
@@ -185,6 +196,21 @@ export function initSocket(httpServer) {
       const user = connectedUsers.get(socket.id);
       console.log(`🔴 Disconnected socket: ${socket.id}, user: ${user}`);
       connectedUsers.delete(socket.id);
+
+      if (!user) return;
+
+      const stillConnected = [...connectedUsers.values()].some((value) => value === user);
+      if (!stillConnected) {
+        setUserOnlineStatus({ identifier: user, isOnline: false }).catch((error) => {
+          console.error("❌ Failed to set user offline:", error.message);
+        });
+
+        io.emit("presenceUpdate", {
+          identifier: user,
+          isOnline: false,
+          lastSeen: new Date().toISOString(),
+        });
+      }
     });
   });
 
