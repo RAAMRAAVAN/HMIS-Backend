@@ -13,6 +13,7 @@ import fs from "fs/promises";
 import path from "path";
 import { parseChatBody } from "../utils/chatMessageFormat.js";
 import { getIO, getSocketPresenceSnapshot } from "../socket.js";
+import { normalizeDbTimestampToIso } from "../utils/time.js";
 
 const SESSION_TTL_SECONDS = 7 * 24 * 60 * 60;
 const MAX_ACTIVE_SESSIONS_PER_USER = Number(process.env.MAX_ACTIVE_SESSIONS_PER_USER || 5);
@@ -411,6 +412,7 @@ export const getChatHistory = async (req, res) => {
         m.receiver_id,
         m.body,
         m.created_at,
+        (EXTRACT(EPOCH FROM (m.created_at AT TIME ZONE 'UTC')) * 1000)::bigint AS created_at_ms,
         m.status,
         COALESCE(m.is_read, false) AS is_read,
         LOWER(s.email) AS sender_email,
@@ -438,7 +440,8 @@ export const getChatHistory = async (req, res) => {
         messageType: parsedBody.messageType,
         file: parsedBody.file,
         status: row.status || (row.is_read ? "read" : "sent"),
-        timestamp: row.created_at,
+        timestamp: Number(row.created_at_ms) || Date.now(),
+        createdAt: normalizeDbTimestampToIso(row.created_at),
         fromID: row.sender_id,
         toID: row.receiver_id,
         isRead: row.is_read,

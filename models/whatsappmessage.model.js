@@ -4,7 +4,7 @@ export const createMessage = async ({ conversationId, senderId, receiverID, body
   const query = `
     INSERT INTO messages (conversation_id, sender_id, receiver_id, body, status, is_read)
     VALUES ($1, $2, $3, $4, $5, $6)
-    RETURNING *;
+    RETURNING *, (EXTRACT(EPOCH FROM (created_at AT TIME ZONE 'UTC')) * 1000)::bigint AS created_at_ms;
   `;
   const values = [conversationId, senderId, receiverID, body, status, isRead];
   const result = await pool.query(query, values);

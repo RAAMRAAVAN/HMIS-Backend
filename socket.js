@@ -2,6 +2,7 @@ import { Server } from "socket.io";
 import { createMessage, updateMessageStatus } from "./models/whatsappmessage.model.js";
 import { serializeChatBody } from "./utils/chatMessageFormat.js";
 import { setUserOnlineStatus } from "./models/user.model.js";
+import { normalizeDbTimestampToIso } from "./utils/time.js";
 
 let io = null;
 
@@ -201,7 +202,8 @@ export function initSocket(httpServer) {
           status: initialStatus,
           isRead: false,
           conversationId: data.conversationId || null,
-          createdAt: savedMessage.created_at || new Date().toISOString(),
+          createdAtMs: Number(savedMessage.created_at_ms) || Date.now(),
+          createdAt: normalizeDbTimestampToIso(savedMessage.created_at) || new Date().toISOString(),
         };
 
         io.to(toRoom).emit("privateMessage", payload);
