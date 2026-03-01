@@ -7,22 +7,46 @@ let io = null;
 
 // Track users by socket id
 const connectedUsers = new Map();
-const activeConnectionCountByUser = new Map();
+const lastPresenceWriteByUser = new Map();
+const PRESENCE_WRITE_THROTTLE_MS = 15_000;
 
-function incrementUserConnection(userId) {
-  const current = activeConnectionCountByUser.get(userId) || 0;
-  activeConnectionCountByUser.set(userId, current + 1);
+function hasActiveSocketForUser(userId) {
+  for (const connectedUser of connectedUsers.values()) {
+    if (connectedUser === userId) return true;
+  }
+  return false;
 }
 
-function decrementUserConnection(userId) {
-  const current = activeConnectionCountByUser.get(userId) || 0;
-  const next = Math.max(current - 1, 0);
-  if (next === 0) {
-    activeConnectionCountByUser.delete(userId);
-  } else {
-    activeConnectionCountByUser.set(userId, next);
+function countActiveSocketsForUser(userId) {
+  let count = 0;
+  for (const connectedUser of connectedUsers.values()) {
+    if (connectedUser === userId) count += 1;
   }
-  return next;
+  return count;
+}
+
+function shouldWritePresence(userId) {
+  const now = Date.now();
+  const lastWrite = lastPresenceWriteByUser.get(userId) || 0;
+  if (now - lastWrite < PRESENCE_WRITE_THROTTLE_MS) return false;
+  lastPresenceWriteByUser.set(userId, now);
+  return true;
+}
+
+export function getSocketPresenceSnapshot() {
+  const counts = new Map();
+
+  for (const [socketId, identifier] of connectedUsers.entries()) {
+    const current = counts.get(identifier) || { identifier, connectionCount: 0, socketIds: [] };
+    current.connectionCount += 1;
+    current.socketIds.push(socketId);
+    counts.set(identifier, current);
+  }
+
+  return {
+    totalSockets: connectedUsers.size,
+    users: Array.from(counts.values()).sort((a, b) => b.connectionCount - a.connectionCount),
+  };
 }
 
 export function initSocket(httpServer) {
@@ -56,24 +80,56 @@ export function initSocket(httpServer) {
       console.log(`👤 User registered → user: ${roomId}, socket: ${socket.id}`);
 
       const previousUser = connectedUsers.get(socket.id);
+      if (previousUser === roomId) {
+        if (!socket.rooms.has(roomId)) {
+          socket.join(roomId);
+        }
+        return;
+      }
+
       if (previousUser && previousUser !== roomId) {
-        decrementUserConnection(previousUser);
+        connectedUsers.delete(socket.id);
+        if (!hasActiveSocketForUser(previousUser)) {
+          setUserOnlineStatus({ identifier: previousUser, isOnline: false }).catch((error) => {
+            console.error("❌ Failed to set previous user offline:", error.message);
+          });
+
+          io.emit("presenceUpdate", {
+            identifier: previousUser,
+            isOnline: false,
+            lastSeen: new Date().toISOString(),
+          });
+        }
       }
 
       connectedUsers.set(socket.id, roomId);
-      incrementUserConnection(roomId);
 
       // Join user-specific room
       socket.join(roomId);
 
+      const activeCount = countActiveSocketsForUser(roomId);
+      console.log(`🧮 Active sockets for ${roomId}: ${activeCount}`);
+
       setUserOnlineStatus({ identifier: roomId, isOnline: true }).catch((error) => {
         console.error("❌ Failed to set user online:", error.message);
       });
+      lastPresenceWriteByUser.set(roomId, Date.now());
 
       io.emit("presenceUpdate", {
         identifier: roomId,
         isOnline: true,
         lastSeen: null,
+      });
+    });
+
+    socket.on("presencePing", () => {
+      const user = connectedUsers.get(socket.id);
+      if (!user) return;
+
+      if (!shouldWritePresence(user)) return;
+
+      setUserOnlineStatus({ identifier: user, isOnline: true }).catch((error) => {
+        console.error("❌ Failed to refresh user presence:", error.message);
       });
     });
 
@@ -226,17 +282,20 @@ export function initSocket(httpServer) {
 
       if (!user) return;
 
-      const remainingConnections = decrementUserConnection(user);
-      if (remainingConnections === 0) {
+      if (!hasActiveSocketForUser(user)) {
         setUserOnlineStatus({ identifier: user, isOnline: false }).catch((error) => {
           console.error("❌ Failed to set user offline:", error.message);
         });
+        lastPresenceWriteByUser.delete(user);
 
         io.emit("presenceUpdate", {
           identifier: user,
           isOnline: false,
           lastSeen: new Date().toISOString(),
         });
+      } else {
+        const activeCount = countActiveSocketsForUser(user);
+        console.log(`🧮 Remaining active sockets for ${user}: ${activeCount}`);
       }
     });
   });

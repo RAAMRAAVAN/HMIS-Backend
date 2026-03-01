@@ -12,7 +12,55 @@ import { redis } from "../src/config/redis.js";
 import fs from "fs/promises";
 import path from "path";
 import { parseChatBody } from "../utils/chatMessageFormat.js";
-import { getIO } from "../socket.js";
+import { getIO, getSocketPresenceSnapshot } from "../socket.js";
+
+const SESSION_TTL_SECONDS = 7 * 24 * 60 * 60;
+const MAX_ACTIVE_SESSIONS_PER_USER = Number(process.env.MAX_ACTIVE_SESSIONS_PER_USER || 5);
+
+function getUserSessionIndexKey(userId) {
+  return `user_sessions:${userId}`;
+}
+
+async function pruneStaleUserSessionIndex(userId) {
+  const indexKey = getUserSessionIndexKey(userId);
+  const sessionIds = await redis.zRange(indexKey, 0, -1);
+
+  if (!sessionIds.length) return;
+
+  const pipeline = redis.multi();
+  for (const sessionId of sessionIds) {
+    pipeline.exists(`session:${sessionId}`);
+  }
+
+  const existsResults = await pipeline.exec();
+  const staleSessionIds = [];
+
+  for (let i = 0; i < existsResults.length; i += 1) {
+    const existsCount = Number(existsResults[i] || 0);
+    if (existsCount === 0) {
+      staleSessionIds.push(sessionIds[i]);
+    }
+  }
+
+  if (staleSessionIds.length) {
+    await redis.zRem(indexKey, staleSessionIds);
+  }
+}
+
+async function evictOldestUserSessions(userId, sessionsToEvict) {
+  if (sessionsToEvict <= 0) return;
+
+  const indexKey = getUserSessionIndexKey(userId);
+  const sessionIds = await redis.zRange(indexKey, 0, sessionsToEvict - 1);
+  if (!sessionIds.length) return;
+
+  const pipeline = redis.multi();
+  for (const sessionId of sessionIds) {
+    pipeline.del(`session:${sessionId}`);
+  }
+  pipeline.zRem(indexKey, sessionIds);
+  await pipeline.exec();
+}
 
 async function getSessionUserFromRequest(req) {
   const sessionId = req.cookies.sessionId;
@@ -135,18 +183,36 @@ export async function login(req, res) {
       });
     }
 
+    await pruneStaleUserSessionIndex(user.id);
+
+    const userSessionIndexKey = getUserSessionIndexKey(user.id);
+    const activeSessions = await redis.zCard(userSessionIndexKey);
+    if (activeSessions >= MAX_ACTIVE_SESSIONS_PER_USER) {
+      const sessionsToEvict = activeSessions - MAX_ACTIVE_SESSIONS_PER_USER + 1;
+      await evictOldestUserSessions(user.id, sessionsToEvict);
+    }
+
     // ====== SESSION LOGIC ======
     const sessionId = uuidv4(); // generate unique session ID
-
-    // Store session in Redis for 7 days
-    await redis.set(`session:${sessionId}`, JSON.stringify({
+    const sessionPayload = {
       id: user.id,
       name: user.name,
       email: user.email,
-      role: user.role
-    }), {
-      EX: 7 * 24 * 60 * 60 // 7 days in seconds
+      role: user.role,
+      sessionId,
+      createdAt: new Date().toISOString(),
+    };
+
+    // Store session in Redis for 7 days
+    await redis.set(`session:${sessionId}`, JSON.stringify(sessionPayload), {
+      EX: SESSION_TTL_SECONDS
     });
+
+    await redis.zAdd(userSessionIndexKey, [{
+      score: Date.now(),
+      value: sessionId,
+    }]);
+    await redis.expire(userSessionIndexKey, SESSION_TTL_SECONDS);
 
     // Send cookie to client
     res.cookie("sessionId", sessionId, {
@@ -192,7 +258,14 @@ export const logout = async (req, res) => {
     }
 
     const sessionId = req.cookies.sessionId;
-    if (sessionId) await redis.del(`session:${sessionId}`);
+    if (sessionId) {
+      await redis.del(`session:${sessionId}`);
+
+      if (sessionUser?.id) {
+        const userSessionIndexKey = getUserSessionIndexKey(sessionUser.id);
+        await redis.zRem(userSessionIndexKey, sessionId);
+      }
+    }
     res.clearCookie("sessionId");
     res.json({ success: true, message: "Logged out successfully" });
   } catch (error) {
@@ -221,6 +294,99 @@ export const sessionLogin = async (req,res)=>{
     });
   } catch (error) {
     console.error("Session login error:", error);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+
+export const getSessionDiagnostics = async (req, res) => {
+  try {
+    const sessionGroups = new Map();
+    const sessionKeyPrefix = "session:";
+
+    let cursor = "0";
+    do {
+      const scanResult = await redis.scan(cursor, {
+        MATCH: `${sessionKeyPrefix}*`,
+        COUNT: 200,
+      });
+
+      cursor = String(scanResult?.cursor ?? "0");
+      const keys = scanResult?.keys || [];
+
+      for (const key of keys) {
+        const sessionId = String(key).slice(sessionKeyPrefix.length);
+        const value = await redis.get(key);
+        if (!value) continue;
+
+        let parsed;
+        try {
+          parsed = JSON.parse(value);
+        } catch {
+          continue;
+        }
+
+        const identifier = String(parsed?.email || parsed?.name || parsed?.id || "unknown").toLowerCase();
+        const group = sessionGroups.get(identifier) || {
+          identifier,
+          userId: parsed?.id ?? null,
+          name: parsed?.name ?? null,
+          email: parsed?.email ?? null,
+          redisSessionCount: 0,
+          redisSessionIds: [],
+        };
+
+        group.redisSessionCount += 1;
+        group.redisSessionIds.push(sessionId);
+        sessionGroups.set(identifier, group);
+      }
+    } while (cursor !== "0");
+
+    const socketSnapshot = getSocketPresenceSnapshot();
+    const socketMap = new Map(socketSnapshot.users.map((item) => [item.identifier, item]));
+
+    for (const [identifier, group] of sessionGroups.entries()) {
+      const socketInfo = socketMap.get(identifier);
+      group.socketConnectionCount = socketInfo?.connectionCount || 0;
+      group.socketIds = socketInfo?.socketIds || [];
+      group.inferredOnline = group.socketConnectionCount > 0;
+    }
+
+    for (const socketInfo of socketSnapshot.users) {
+      if (sessionGroups.has(socketInfo.identifier)) continue;
+      sessionGroups.set(socketInfo.identifier, {
+        identifier: socketInfo.identifier,
+        userId: null,
+        name: null,
+        email: socketInfo.identifier,
+        redisSessionCount: 0,
+        redisSessionIds: [],
+        socketConnectionCount: socketInfo.connectionCount,
+        socketIds: socketInfo.socketIds,
+        inferredOnline: socketInfo.connectionCount > 0,
+      });
+    }
+
+    const data = Array.from(sessionGroups.values()).sort((a, b) => {
+      if (b.socketConnectionCount !== a.socketConnectionCount) {
+        return b.socketConnectionCount - a.socketConnectionCount;
+      }
+      if (b.redisSessionCount !== a.redisSessionCount) {
+        return b.redisSessionCount - a.redisSessionCount;
+      }
+      return a.identifier.localeCompare(b.identifier);
+    });
+
+    return res.json({
+      success: true,
+      summary: {
+        totalRedisSessions: data.reduce((sum, item) => sum + item.redisSessionCount, 0),
+        totalSocketConnections: socketSnapshot.totalSockets,
+        usersTracked: data.length,
+      },
+      data,
+    });
+  } catch (error) {
+    console.error("Session diagnostics error:", error);
     return res.status(500).json({ success: false, message: "Server error" });
   }
 };

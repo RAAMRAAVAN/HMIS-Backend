@@ -9,7 +9,10 @@ export const getAllUsersFromDB = async () => {
         email,
         role,
         created_at,
-        (is_online IS NOT NULL) AS is_online,
+        (
+          is_online IS NOT NULL
+          AND is_online >= ((NOW() AT TIME ZONE 'UTC') - INTERVAL '40 seconds')
+        ) AS is_online,
         CASE
           WHEN is_online IS NULL THEN NULL
           ELSE to_char(is_online, 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')

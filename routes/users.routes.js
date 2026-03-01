@@ -6,6 +6,7 @@ import {
   login,
   logout,
   sessionLogin,
+  getSessionDiagnostics,
   getChatHistory,
   getChatOverview,
   markChatAsRead,
@@ -41,6 +42,7 @@ router.get("/", readRateLimit, getAllUsers);
 router.post("/", writeRateLimit, createUser);
 router.post("/login", loginRateLimit, login);
 router.get("/sessionLogin", readRateLimit, sessionLogin)
+router.get("/debug/sessions", readRateLimit, getSessionDiagnostics);
 router.post("/logout", writeRateLimit, logout);
 router.get("/chat-overview", readRateLimit, getChatOverview);
 router.get("/chat-history/:otherUserId", readRateLimit, getChatHistory);
