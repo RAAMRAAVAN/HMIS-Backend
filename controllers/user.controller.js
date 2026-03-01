@@ -77,6 +77,22 @@ async function getSessionUserFromRequest(req) {
   }
 }
 
+async function requireAdminSession(req, res) {
+  const sessionUser = await getSessionUserFromRequest(req);
+
+  if (!sessionUser?.id) {
+    res.status(401).json({ success: false, message: "Unauthorized" });
+    return null;
+  }
+
+  if (String(sessionUser.role || "").toLowerCase() !== "admin") {
+    res.status(403).json({ success: false, message: "Admin access required" });
+    return null;
+  }
+
+  return sessionUser;
+}
+
 function getFileKind(mimeType = "") {
   if (mimeType.startsWith("image/")) return "image";
   if (mimeType.startsWith("video/")) return "video";
@@ -117,6 +133,9 @@ export const getAllUsers = async (req, res) => {
 
 export const createUser = async (req, res) => {
   try {
+    const adminUser = await requireAdminSession(req, res);
+    if (!adminUser) return;
+
     const { name, email, username, userId, password, role = "user" } = req.body;
     const resolvedName = name || username;
     const resolvedEmail = email || userId;
@@ -143,6 +162,121 @@ export const createUser = async (req, res) => {
     }
     console.error("Create user error:", error);
     res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+
+export const updateUserByAdmin = async (req, res) => {
+  try {
+    const adminUser = await requireAdminSession(req, res);
+    if (!adminUser) return;
+
+    const targetUserId = Number(req.params.id);
+    if (!targetUserId) {
+      return res.status(400).json({ success: false, message: "Invalid user id" });
+    }
+
+    const { name, email, role, password } = req.body || {};
+
+    const updates = [];
+    const values = [];
+    let paramIndex = 1;
+
+    if (typeof name === "string" && name.trim()) {
+      updates.push(`name = $${paramIndex++}`);
+      values.push(name.trim());
+    }
+
+    if (typeof email === "string" && email.trim()) {
+      updates.push(`email = $${paramIndex++}`);
+      values.push(email.trim().toLowerCase());
+    }
+
+    if (typeof role === "string" && role.trim()) {
+      const normalizedRole = role.trim().toLowerCase();
+      const allowedRoles = new Set(["user", "admin", "superadmin"]);
+      if (!allowedRoles.has(normalizedRole)) {
+        return res.status(400).json({ success: false, message: "Invalid role" });
+      }
+      updates.push(`role = $${paramIndex++}`);
+      values.push(normalizedRole);
+    }
+
+    if (typeof password === "string" && password.length > 0) {
+      const hashedPassword = await bcrypt.hash(password, 10);
+      updates.push(`password = $${paramIndex++}`);
+      values.push(hashedPassword);
+    }
+
+    if (!updates.length) {
+      return res.status(400).json({ success: false, message: "No valid fields to update" });
+    }
+
+    values.push(targetUserId);
+
+    const result = await pool.query(
+      `
+        UPDATE users
+        SET ${updates.join(", ")}
+        WHERE id = $${paramIndex}
+        RETURNING id, name, email, role
+      `,
+      values
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    return res.json({ success: true, data: result.rows[0] });
+  } catch (error) {
+    if (error?.code === "23505") {
+      return res.status(409).json({ success: false, message: "Email already exists" });
+    }
+    console.error("Update user error:", error);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+
+export const deleteUserByAdmin = async (req, res) => {
+  try {
+    const adminUser = await requireAdminSession(req, res);
+    if (!adminUser) return;
+
+    const targetUserId = Number(req.params.id);
+    if (!targetUserId) {
+      return res.status(400).json({ success: false, message: "Invalid user id" });
+    }
+
+    if (Number(adminUser.id) === targetUserId) {
+      return res.status(400).json({ success: false, message: "You cannot delete your own account" });
+    }
+
+    const deleteResult = await pool.query(
+      `DELETE FROM users WHERE id = $1 RETURNING id, name, email, role`,
+      [targetUserId]
+    );
+
+    if (!deleteResult.rows.length) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    const userSessionIndexKey = getUserSessionIndexKey(targetUserId);
+    const sessionIds = await redis.zRange(userSessionIndexKey, 0, -1);
+    if (sessionIds.length) {
+      const pipeline = redis.multi();
+      for (const sessionId of sessionIds) {
+        pipeline.del(`session:${sessionId}`);
+      }
+      pipeline.del(userSessionIndexKey);
+      await pipeline.exec();
+    } else {
+      await redis.del(userSessionIndexKey);
+    }
+
+    return res.json({ success: true, data: deleteResult.rows[0] });
+  } catch (error) {
+    console.error("Delete user error:", error);
+    return res.status(500).json({ success: false, message: "Server error" });
   }
 };
 
@@ -493,7 +627,8 @@ export const getChatOverview = async (req, res) => {
           AND COALESCE(m.is_read, false) = false
       ) unseen ON true
       WHERE u.id <> $1
-      ORDER BY COALESCE(last_msg.created_at, u.created_at) DESC, u.name ASC
+        AND last_msg.created_at IS NOT NULL
+      ORDER BY last_msg.created_at DESC, u.name ASC
       `,
       [sessionUser.id]
     );
@@ -506,6 +641,80 @@ export const getChatOverview = async (req, res) => {
     return res.json({ success: true, data });
   } catch (error) {
     console.error("Chat overview error:", error);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+
+export const getChatSuggestions = async (req, res) => {
+  try {
+    const sessionUser = await getSessionUserFromRequest(req);
+    if (!sessionUser?.id) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+
+    const queryText = String(req.query.q || "").trim().toLowerCase();
+    if (!queryText) {
+      return res.json({ success: true, data: [] });
+    }
+
+    const requestedLimit = Number(req.query.limit || 12);
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.min(Math.max(requestedLimit, 1), 30)
+      : 12;
+
+    const result = await pool.query(
+      `
+      SELECT
+        u.id,
+        u.name,
+        LOWER(u.email) AS email,
+        (
+          u.is_online IS NOT NULL
+          AND u.is_online >= ((NOW() AT TIME ZONE 'UTC') - INTERVAL '40 seconds')
+        ) AS is_online,
+        CASE
+          WHEN u.last_seen IS NULL THEN NULL
+          ELSE to_char(u.last_seen, 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+        END AS last_seen,
+        COALESCE(last_msg.body, '') AS last_message,
+        (EXTRACT(EPOCH FROM (last_msg.created_at AT TIME ZONE 'UTC')) * 1000)::bigint AS last_message_at_ms,
+        (last_msg.created_at IS NOT NULL) AS has_history
+      FROM users u
+      LEFT JOIN LATERAL (
+        SELECT m.body, m.created_at
+        FROM messages m
+        WHERE
+          (m.sender_id = $1 AND m.receiver_id = u.id)
+          OR
+          (m.sender_id = u.id AND m.receiver_id = $1)
+        ORDER BY m.created_at DESC
+        LIMIT 1
+      ) last_msg ON true
+      WHERE
+        u.id <> $1
+        AND (
+          LOWER(u.name) LIKE $2
+          OR LOWER(u.email) LIKE $2
+        )
+      ORDER BY
+        (last_msg.created_at IS NOT NULL) DESC,
+        COALESCE(last_msg.created_at, u.created_at) DESC,
+        u.name ASC
+      LIMIT $3
+      `,
+      [sessionUser.id, `%${queryText}%`, limit]
+    );
+
+    const data = result.rows.map((row) => ({
+      ...row,
+      has_history: Boolean(row.has_history),
+      is_online: Boolean(row.is_online),
+      last_message_at_ms: row.last_message_at_ms ? Number(row.last_message_at_ms) : null,
+    }));
+
+    return res.json({ success: true, data });
+  } catch (error) {
+    console.error("Chat suggestions error:", error);
     return res.status(500).json({ success: false, message: "Server error" });
   }
 };

@@ -3,12 +3,15 @@ import multer from "multer";
 import {
   getAllUsers,
   createUser,
+  updateUserByAdmin,
+  deleteUserByAdmin,
   login,
   logout,
   sessionLogin,
   getSessionDiagnostics,
   getChatHistory,
   getChatOverview,
+  getChatSuggestions,
   markChatAsRead,
   uploadChatFile,
 } from "../controllers/user.controller.js";
@@ -40,11 +43,14 @@ const writeRateLimit = createRateLimiter({
 
 router.get("/", readRateLimit, getAllUsers);
 router.post("/", writeRateLimit, createUser);
+router.put("/:id", writeRateLimit, updateUserByAdmin);
+router.delete("/:id", writeRateLimit, deleteUserByAdmin);
 router.post("/login", loginRateLimit, login);
 router.get("/sessionLogin", readRateLimit, sessionLogin)
 router.get("/debug/sessions", readRateLimit, getSessionDiagnostics);
 router.post("/logout", writeRateLimit, logout);
 router.get("/chat-overview", readRateLimit, getChatOverview);
+router.get("/chat-suggestions", readRateLimit, getChatSuggestions);
 router.get("/chat-history/:otherUserId", readRateLimit, getChatHistory);
 router.post("/chat-read/:otherUserId", writeRateLimit, markChatAsRead);
 router.post("/chat-upload", writeRateLimit, upload.single("file"), uploadChatFile);
