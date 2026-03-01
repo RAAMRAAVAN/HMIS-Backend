@@ -7,6 +7,23 @@ let io = null;
 
 // Track users by socket id
 const connectedUsers = new Map();
+const activeConnectionCountByUser = new Map();
+
+function incrementUserConnection(userId) {
+  const current = activeConnectionCountByUser.get(userId) || 0;
+  activeConnectionCountByUser.set(userId, current + 1);
+}
+
+function decrementUserConnection(userId) {
+  const current = activeConnectionCountByUser.get(userId) || 0;
+  const next = Math.max(current - 1, 0);
+  if (next === 0) {
+    activeConnectionCountByUser.delete(userId);
+  } else {
+    activeConnectionCountByUser.set(userId, next);
+  }
+  return next;
+}
 
 export function initSocket(httpServer) {
   if (io) return io; // Prevent re-init
@@ -34,7 +51,14 @@ export function initSocket(httpServer) {
 
       const roomId = userEmail.toString().toLowerCase();
       console.log(`👤 User registered → user: ${roomId}, socket: ${socket.id}`);
+
+      const previousUser = connectedUsers.get(socket.id);
+      if (previousUser && previousUser !== roomId) {
+        decrementUserConnection(previousUser);
+      }
+
       connectedUsers.set(socket.id, roomId);
+      incrementUserConnection(roomId);
 
       // Join user-specific room
       socket.join(roomId);
@@ -199,8 +223,8 @@ export function initSocket(httpServer) {
 
       if (!user) return;
 
-      const stillConnected = [...connectedUsers.values()].some((value) => value === user);
-      if (!stillConnected) {
+      const remainingConnections = decrementUserConnection(user);
+      if (remainingConnections === 0) {
         setUserOnlineStatus({ identifier: user, isOnline: false }).catch((error) => {
           console.error("❌ Failed to set user offline:", error.message);
         });
