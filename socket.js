@@ -203,6 +203,8 @@ export function initSocket(httpServer) {
           isRead: false,
           conversationId: data.conversationId || null,
           createdAtMs: Number(savedMessage.created_at_ms) || Date.now(),
+          timestampMs: Number(savedMessage.created_at_ms) || Date.now(),
+          timestamp: Number(savedMessage.created_at_ms) || Date.now(),
           createdAt: normalizeDbTimestampToIso(savedMessage.created_at) || new Date().toISOString(),
         };
 

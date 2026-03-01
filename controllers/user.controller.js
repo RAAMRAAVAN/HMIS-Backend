@@ -440,6 +440,7 @@ export const getChatHistory = async (req, res) => {
         messageType: parsedBody.messageType,
         file: parsedBody.file,
         status: row.status || (row.is_read ? "read" : "sent"),
+        timestampMs: Number(row.created_at_ms) || Date.now(),
         timestamp: Number(row.created_at_ms) || Date.now(),
         createdAt: normalizeDbTimestampToIso(row.created_at),
         fromID: row.sender_id,
@@ -470,6 +471,7 @@ export const getChatOverview = async (req, res) => {
         LOWER(u.email) AS email,
         COALESCE(last_msg.body, '') AS last_message,
         last_msg.created_at AS last_message_at,
+        (EXTRACT(EPOCH FROM (last_msg.created_at AT TIME ZONE 'UTC')) * 1000)::bigint AS last_message_at_ms,
         COALESCE(unseen.unseen_count, 0) AS unseen_count
       FROM users u
       LEFT JOIN LATERAL (
@@ -496,7 +498,12 @@ export const getChatOverview = async (req, res) => {
       [sessionUser.id]
     );
 
-    return res.json({ success: true, data: result.rows });
+    const data = result.rows.map((row) => ({
+      ...row,
+      last_message_at_ms: row.last_message_at_ms ? Number(row.last_message_at_ms) : null,
+    }));
+
+    return res.json({ success: true, data });
   } catch (error) {
     console.error("Chat overview error:", error);
     return res.status(500).json({ success: false, message: "Server error" });
