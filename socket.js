@@ -9,6 +9,8 @@ let io = null;
 // Track users by socket id
 const connectedUsers = new Map();
 const lastPresenceWriteByUser = new Map();
+const activeCallByUser = new Map();
+const participantsByCallId = new Map();
 const PRESENCE_WRITE_THROTTLE_MS = 15_000;
 
 function hasActiveSocketForUser(userId) {
@@ -32,6 +34,69 @@ function shouldWritePresence(userId) {
   if (now - lastWrite < PRESENCE_WRITE_THROTTLE_MS) return false;
   lastPresenceWriteByUser.set(userId, now);
   return true;
+}
+
+function normalizeIdentifier(value) {
+  return String(value || "").toLowerCase().trim();
+}
+
+function getSocketIdsForUser(userId) {
+  const normalizedUser = normalizeIdentifier(userId);
+  if (!normalizedUser) return [];
+
+  const socketIds = [];
+  for (const [socketId, connectedUser] of connectedUsers.entries()) {
+    if (connectedUser === normalizedUser) {
+      socketIds.push(socketId);
+    }
+  }
+
+  return socketIds;
+}
+
+function emitToExactUser(userId, eventName, payload) {
+  const socketIds = getSocketIdsForUser(userId);
+  socketIds.forEach((socketId) => {
+    io.to(socketId).emit(eventName, payload);
+  });
+  return socketIds.length;
+}
+
+function getActiveCallIdForUser(userId) {
+  return activeCallByUser.get(normalizeIdentifier(userId)) || null;
+}
+
+function linkCallParticipants(callId, users = []) {
+  const normalizedCallId = String(callId || "").trim();
+  if (!normalizedCallId) return;
+
+  const participantSet = participantsByCallId.get(normalizedCallId) || new Set();
+  users
+    .map((value) => normalizeIdentifier(value))
+    .filter(Boolean)
+    .forEach((identifier) => {
+      participantSet.add(identifier);
+      activeCallByUser.set(identifier, normalizedCallId);
+    });
+
+  participantsByCallId.set(normalizedCallId, participantSet);
+}
+
+function clearCallMapping(callId) {
+  const normalizedCallId = String(callId || "").trim();
+  if (!normalizedCallId) return;
+
+  const participantSet = participantsByCallId.get(normalizedCallId);
+  if (participantSet) {
+    for (const identifier of participantSet.values()) {
+      const mappedCallId = activeCallByUser.get(identifier);
+      if (mappedCallId === normalizedCallId) {
+        activeCallByUser.delete(identifier);
+      }
+    }
+  }
+
+  participantsByCallId.delete(normalizedCallId);
 }
 
 export function getSocketPresenceSnapshot() {
@@ -276,6 +341,179 @@ export function initSocket(httpServer) {
       }
     });
 
+    socket.on("call:offer", (payload = {}) => {
+      const registeredUser = normalizeIdentifier(connectedUsers.get(socket.id));
+      const from = registeredUser;
+      const to = normalizeIdentifier(payload.to || payload.toEmail);
+      const callType = payload.callType === "video" ? "video" : "audio";
+      const sdp = payload?.sdp;
+      const callId = String(payload.callId || "").trim();
+      const phase = payload.phase === "renegotiate" ? "renegotiate" : "invite";
+
+      if (!registeredUser || !from || !to || from === to || !sdp || !callId) {
+        socket.emit("socket_error", { message: "Invalid call:offer payload" });
+        return;
+      }
+
+      if (phase === "invite") {
+        const fromActiveCallId = getActiveCallIdForUser(from);
+        const toActiveCallId = getActiveCallIdForUser(to);
+
+        if ((fromActiveCallId && fromActiveCallId !== callId) || (toActiveCallId && toActiveCallId !== callId)) {
+          emitToExactUser(from, "call:busy", {
+            callId,
+            from: to,
+            to: from,
+            reason: "engaged",
+            createdAt: Date.now(),
+          });
+          return;
+        }
+      }
+
+      const deliveredCount = emitToExactUser(to, "call:offer", {
+        callId,
+        from,
+        to,
+        phase,
+        callType,
+        sdp,
+        createdAt: Date.now(),
+      });
+
+      if (deliveredCount === 0) {
+        socket.emit("call:unavailable", {
+          callId,
+          to,
+          reason: "offline",
+          createdAt: Date.now(),
+        });
+        if (phase === "invite") {
+          clearCallMapping(callId);
+        }
+        return;
+      }
+
+      if (phase === "invite") {
+        linkCallParticipants(callId, [from, to]);
+      }
+    });
+
+    socket.on("call:answer", (payload = {}) => {
+      const registeredUser = normalizeIdentifier(connectedUsers.get(socket.id));
+      const from = registeredUser;
+      const to = normalizeIdentifier(payload.to || payload.toEmail);
+      const sdp = payload?.sdp;
+      const callId = String(payload.callId || "").trim();
+
+      if (!registeredUser || !from || !to || from === to || !sdp || !callId) {
+        socket.emit("socket_error", { message: "Invalid call:answer payload" });
+        return;
+      }
+
+      emitToExactUser(to, "call:answer", {
+        callId,
+        from,
+        to,
+        sdp,
+        createdAt: Date.now(),
+      });
+
+      linkCallParticipants(callId, [from, to]);
+    });
+
+    socket.on("call:ice-candidate", (payload = {}) => {
+      const registeredUser = normalizeIdentifier(connectedUsers.get(socket.id));
+      const from = registeredUser;
+      const to = normalizeIdentifier(payload.to || payload.toEmail);
+      const candidate = payload?.candidate;
+      const callId = String(payload.callId || "").trim();
+
+      if (!registeredUser || !from || !to || from === to || !candidate || !callId) return;
+
+      emitToExactUser(to, "call:ice-candidate", {
+        callId,
+        from,
+        to,
+        candidate,
+      });
+    });
+
+    socket.on("call:reject", (payload = {}) => {
+      const registeredUser = normalizeIdentifier(connectedUsers.get(socket.id));
+      const from = registeredUser;
+      const to = normalizeIdentifier(payload.to || payload.toEmail);
+      const callId = String(payload.callId || "").trim();
+
+      if (!registeredUser || !from || !to || from === to || !callId) return;
+
+      emitToExactUser(to, "call:reject", {
+        callId,
+        from,
+        to,
+        reason: String(payload.reason || "declined"),
+        createdAt: Date.now(),
+      });
+
+      clearCallMapping(callId);
+    });
+
+    socket.on("call:end", (payload = {}) => {
+      const registeredUser = normalizeIdentifier(connectedUsers.get(socket.id));
+      const from = registeredUser;
+      const to = normalizeIdentifier(payload.to || payload.toEmail);
+      const callId = String(payload.callId || "").trim();
+
+      if (!registeredUser || !from || !to || from === to || !callId) return;
+
+      emitToExactUser(to, "call:end", {
+        callId,
+        from,
+        to,
+        createdAt: Date.now(),
+      });
+
+      clearCallMapping(callId);
+    });
+
+    socket.on("call:hold", (payload = {}) => {
+      const registeredUser = normalizeIdentifier(connectedUsers.get(socket.id));
+      const from = registeredUser;
+      const to = normalizeIdentifier(payload.to || payload.toEmail);
+      const callId = String(payload.callId || "").trim();
+      const onHold = Boolean(payload.onHold);
+
+      if (!registeredUser || !from || !to || from === to || !callId) return;
+      if (getActiveCallIdForUser(from) !== callId || getActiveCallIdForUser(to) !== callId) return;
+
+      emitToExactUser(to, "call:hold", {
+        callId,
+        from,
+        to,
+        onHold,
+        createdAt: Date.now(),
+      });
+    });
+
+    socket.on("call:media-state", (payload = {}) => {
+      const registeredUser = normalizeIdentifier(connectedUsers.get(socket.id));
+      const from = registeredUser;
+      const to = normalizeIdentifier(payload.to || payload.toEmail);
+      const callId = String(payload.callId || "").trim();
+
+      if (!registeredUser || !from || !to || from === to || !callId) return;
+      if (getActiveCallIdForUser(from) !== callId || getActiveCallIdForUser(to) !== callId) return;
+
+      emitToExactUser(to, "call:media-state", {
+        callId,
+        from,
+        to,
+        micEnabled: payload.micEnabled !== false,
+        cameraEnabled: payload.cameraEnabled !== false,
+        createdAt: Date.now(),
+      });
+    });
+
     /**
      * CLEANUP
      */
@@ -285,6 +523,25 @@ export function initSocket(httpServer) {
       connectedUsers.delete(socket.id);
 
       if (!user) return;
+
+      const normalizedUser = normalizeIdentifier(user);
+      if (!hasActiveSocketForUser(user)) {
+        const activeCallId = getActiveCallIdForUser(normalizedUser);
+        if (activeCallId) {
+          const participants = participantsByCallId.get(activeCallId) || new Set();
+          for (const participant of participants.values()) {
+            if (participant !== normalizedUser) {
+              emitToExactUser(participant, "call:end", {
+                callId: activeCallId,
+                from: normalizedUser,
+                to: participant,
+                createdAt: Date.now(),
+              });
+            }
+          }
+          clearCallMapping(activeCallId);
+        }
+      }
 
       if (!hasActiveSocketForUser(user)) {
         setUserOnlineStatus({ identifier: user, isOnline: false }).catch((error) => {
