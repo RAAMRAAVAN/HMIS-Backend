@@ -573,6 +573,7 @@ export const getChatHistory = async (req, res) => {
         text: parsedBody.text,
         messageType: parsedBody.messageType,
         file: parsedBody.file,
+        call: parsedBody.call || null,
         status: row.status || (row.is_read ? "read" : "sent"),
         timestampMs: Number(row.created_at_ms) || Date.now(),
         timestamp: Number(row.created_at_ms) || Date.now(),
@@ -633,10 +634,14 @@ export const getChatOverview = async (req, res) => {
       [sessionUser.id]
     );
 
-    const data = result.rows.map((row) => ({
-      ...row,
-      last_message_at_ms: row.last_message_at_ms ? Number(row.last_message_at_ms) : null,
-    }));
+    const data = result.rows.map((row) => {
+      const parsedBody = parseChatBody(row.last_message || "");
+      return {
+        ...row,
+        last_message: parsedBody.text || "",
+        last_message_at_ms: row.last_message_at_ms ? Number(row.last_message_at_ms) : null,
+      };
+    });
 
     return res.json({ success: true, data });
   } catch (error) {
@@ -705,12 +710,16 @@ export const getChatSuggestions = async (req, res) => {
       [sessionUser.id, `%${queryText}%`, limit]
     );
 
-    const data = result.rows.map((row) => ({
-      ...row,
-      has_history: Boolean(row.has_history),
-      is_online: Boolean(row.is_online),
-      last_message_at_ms: row.last_message_at_ms ? Number(row.last_message_at_ms) : null,
-    }));
+    const data = result.rows.map((row) => {
+      const parsedBody = parseChatBody(row.last_message || "");
+      return {
+        ...row,
+        last_message: parsedBody.text || "",
+        has_history: Boolean(row.has_history),
+        is_online: Boolean(row.is_online),
+        last_message_at_ms: row.last_message_at_ms ? Number(row.last_message_at_ms) : null,
+      };
+    });
 
     return res.json({ success: true, data });
   } catch (error) {

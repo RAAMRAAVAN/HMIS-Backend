@@ -3,6 +3,7 @@ import { createMessage, updateMessageStatus } from "./models/whatsappmessage.mod
 import { serializeChatBody } from "./utils/chatMessageFormat.js";
 import { setUserOnlineStatus } from "./models/user.model.js";
 import { normalizeDbTimestampToIso } from "./utils/time.js";
+import pool from "./db.js";
 
 let io = null;
 
@@ -11,6 +12,7 @@ const connectedUsers = new Map();
 const lastPresenceWriteByUser = new Map();
 const activeCallByUser = new Map();
 const participantsByCallId = new Map();
+const callMetaByCallId = new Map();
 const PRESENCE_WRITE_THROTTLE_MS = 15_000;
 
 function hasActiveSocketForUser(userId) {
@@ -97,6 +99,142 @@ function clearCallMapping(callId) {
   }
 
   participantsByCallId.delete(normalizedCallId);
+  callMetaByCallId.delete(normalizedCallId);
+}
+
+async function findUserByEmail(email) {
+  const normalizedEmail = normalizeIdentifier(email);
+  if (!normalizedEmail) return null;
+
+  const result = await pool.query(
+    `SELECT id, LOWER(email) AS email FROM users WHERE LOWER(email) = $1 LIMIT 1`,
+    [normalizedEmail]
+  );
+
+  return result.rows[0] || null;
+}
+
+function formatDurationLabel(durationMs) {
+  const safeDurationMs = Math.max(0, Number(durationMs) || 0);
+  const totalSeconds = Math.floor(safeDurationMs / 1000);
+  const minutes = String(Math.floor(totalSeconds / 60)).padStart(2, "0");
+  const seconds = String(totalSeconds % 60).padStart(2, "0");
+  return `${minutes}:${seconds}`;
+}
+
+async function createCallEventMessage({
+  callId,
+  callType,
+  from,
+  to,
+  eventType,
+  durationMs = 0,
+  startedAt = null,
+  answeredAt = null,
+  endedAt = null,
+  reason = null,
+}) {
+  const [sender, receiver] = await Promise.all([findUserByEmail(from), findUserByEmail(to)]);
+  if (!sender?.id || !receiver?.id) return null;
+
+  const voiceOrVideo = callType === "video" ? "Video" : "Voice";
+  let text = `${voiceOrVideo} call`;
+
+  if (eventType === "missed") {
+    text = `Missed ${voiceOrVideo.toLowerCase()} call`;
+  } else if (eventType === "declined") {
+    text = `${voiceOrVideo} call declined`;
+  } else if (eventType === "completed") {
+    text = `${voiceOrVideo} call • ${formatDurationLabel(durationMs)}`;
+  }
+
+  const savedMessage = await createMessage({
+    conversationId: null,
+    senderId: sender.id,
+    receiverID: receiver.id,
+    status: "sent",
+    isRead: false,
+    body: serializeChatBody({
+      text,
+      messageType: "call",
+      call: {
+        callId,
+        callType,
+        eventType,
+        durationMs: Math.max(0, Number(durationMs) || 0),
+        startedAt,
+        answeredAt,
+        endedAt,
+        reason: reason || null,
+      },
+    }),
+  });
+
+  const payload = {
+    id: savedMessage.id,
+    from: normalizeIdentifier(from),
+    to: normalizeIdentifier(to),
+    text,
+    messageType: "call",
+    file: null,
+    call: {
+      callId,
+      callType,
+      eventType,
+      durationMs: Math.max(0, Number(durationMs) || 0),
+      startedAt,
+      answeredAt,
+      endedAt,
+      reason: reason || null,
+    },
+    status: "sent",
+    isRead: false,
+    createdAtMs: Number(savedMessage.created_at_ms) || Date.now(),
+    timestampMs: Number(savedMessage.created_at_ms) || Date.now(),
+    timestamp: Number(savedMessage.created_at_ms) || Date.now(),
+    createdAt: normalizeDbTimestampToIso(savedMessage.created_at) || new Date().toISOString(),
+    fromID: sender.id,
+    toID: receiver.id,
+  };
+
+  io.to(payload.to).emit("privateMessage", payload);
+  if (payload.from !== payload.to) {
+    io.to(payload.from).emit("privateMessage", payload);
+  }
+
+  return payload;
+}
+
+async function persistCallEventForBothParticipants({
+  callId,
+  callType,
+  from,
+  to,
+  eventType,
+  durationMs = 0,
+  startedAt = null,
+  answeredAt = null,
+  endedAt = null,
+  reason = null,
+}) {
+  if (!from || !to) return;
+
+  try {
+    await createCallEventMessage({
+      callId,
+      callType,
+      from,
+      to,
+      eventType,
+      durationMs,
+      startedAt,
+      answeredAt,
+      endedAt,
+      reason,
+    });
+  } catch (error) {
+    console.error("❌ Failed to persist call event:", error.message);
+  }
 }
 
 export function getSocketPresenceSnapshot() {
@@ -389,6 +527,18 @@ export function initSocket(httpServer) {
           createdAt: Date.now(),
         });
         if (phase === "invite") {
+          persistCallEventForBothParticipants({
+            callId,
+            callType,
+            from,
+            to,
+            eventType: "missed",
+            durationMs: 0,
+            startedAt: null,
+            answeredAt: null,
+            endedAt: new Date().toISOString(),
+            reason: "offline",
+          });
           clearCallMapping(callId);
         }
         return;
@@ -396,6 +546,14 @@ export function initSocket(httpServer) {
 
       if (phase === "invite") {
         linkCallParticipants(callId, [from, to]);
+        callMetaByCallId.set(callId, {
+          callId,
+          callType,
+          from,
+          to,
+          startedAt: Date.now(),
+          answeredAt: null,
+        });
       }
     });
 
@@ -420,6 +578,16 @@ export function initSocket(httpServer) {
       });
 
       linkCallParticipants(callId, [from, to]);
+      const meta = callMetaByCallId.get(callId) || {
+        callId,
+        callType: payload.callType === "video" ? "video" : "audio",
+        from: to,
+        to: from,
+        startedAt: Date.now(),
+        answeredAt: null,
+      };
+      meta.answeredAt = Date.now();
+      callMetaByCallId.set(callId, meta);
     });
 
     socket.on("call:ice-candidate", (payload = {}) => {
@@ -455,6 +623,31 @@ export function initSocket(httpServer) {
         createdAt: Date.now(),
       });
 
+      const meta = callMetaByCallId.get(callId) || {
+        callId,
+        callType: payload.callType === "video" ? "video" : "audio",
+        from: to,
+        to: from,
+        startedAt: Date.now(),
+        answeredAt: null,
+      };
+
+      const endedAtIso = new Date().toISOString();
+      const eventType = meta.answeredAt ? "declined" : "missed";
+
+      persistCallEventForBothParticipants({
+        callId,
+        callType: meta.callType || "audio",
+        from: meta.from || to,
+        to: meta.to || from,
+        eventType,
+        durationMs: 0,
+        startedAt: meta.startedAt ? new Date(meta.startedAt).toISOString() : null,
+        answeredAt: meta.answeredAt ? new Date(meta.answeredAt).toISOString() : null,
+        endedAt: endedAtIso,
+        reason: String(payload.reason || "declined"),
+      });
+
       clearCallMapping(callId);
     });
 
@@ -471,6 +664,32 @@ export function initSocket(httpServer) {
         from,
         to,
         createdAt: Date.now(),
+      });
+
+      const meta = callMetaByCallId.get(callId) || {
+        callId,
+        callType: payload.callType === "video" ? "video" : "audio",
+        from,
+        to,
+        startedAt: Date.now(),
+        answeredAt: null,
+      };
+
+      const endMs = Date.now();
+      const answeredAtMs = Number(meta.answeredAt) || null;
+      const durationMs = answeredAtMs ? Math.max(0, endMs - answeredAtMs) : 0;
+
+      persistCallEventForBothParticipants({
+        callId,
+        callType: meta.callType || "audio",
+        from: meta.from || from,
+        to: meta.to || to,
+        eventType: answeredAtMs ? "completed" : "missed",
+        durationMs,
+        startedAt: meta.startedAt ? new Date(meta.startedAt).toISOString() : null,
+        answeredAt: answeredAtMs ? new Date(answeredAtMs).toISOString() : null,
+        endedAt: new Date(endMs).toISOString(),
+        reason: answeredAtMs ? null : "no-answer",
       });
 
       clearCallMapping(callId);
@@ -529,6 +748,7 @@ export function initSocket(httpServer) {
         const activeCallId = getActiveCallIdForUser(normalizedUser);
         if (activeCallId) {
           const participants = participantsByCallId.get(activeCallId) || new Set();
+          const callMeta = callMetaByCallId.get(activeCallId) || null;
           for (const participant of participants.values()) {
             if (participant !== normalizedUser) {
               emitToExactUser(participant, "call:end", {
@@ -539,6 +759,26 @@ export function initSocket(httpServer) {
               });
             }
           }
+
+          if (callMeta?.from && callMeta?.to) {
+            const endMs = Date.now();
+            const answeredAtMs = Number(callMeta.answeredAt) || null;
+            const durationMs = answeredAtMs ? Math.max(0, endMs - answeredAtMs) : 0;
+
+            persistCallEventForBothParticipants({
+              callId: activeCallId,
+              callType: callMeta.callType || "audio",
+              from: callMeta.from,
+              to: callMeta.to,
+              eventType: answeredAtMs ? "completed" : "missed",
+              durationMs,
+              startedAt: callMeta.startedAt ? new Date(callMeta.startedAt).toISOString() : null,
+              answeredAt: answeredAtMs ? new Date(answeredAtMs).toISOString() : null,
+              endedAt: new Date(endMs).toISOString(),
+              reason: "disconnect",
+            });
+          }
+
           clearCallMapping(activeCallId);
         }
       }
