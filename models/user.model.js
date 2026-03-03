@@ -7,6 +7,7 @@ export const getAllUsersFromDB = async () => {
         id,
         name,
         email,
+        profile_image_url,
         role,
         created_at,
         (
@@ -32,7 +33,7 @@ export const createUserInDB = async ({ name, email, password, role }) => {
   const result = await pool.query(
     `INSERT INTO users (name, email, password, role)
      VALUES ($1, $2, $3, $4)
-     RETURNING id, name, email, role`,
+     RETURNING id, name, email, profile_image_url, role`,
     [name, email, password, role]
   );
 
@@ -41,7 +42,7 @@ export const createUserInDB = async ({ name, email, password, role }) => {
 
 export async function findUserByNameModel(identifier) {
   const result = await pool.query(
-    "SELECT id, name, email, password, role FROM users WHERE email = $1 OR name = $1",
+    "SELECT id, name, email, password, profile_image_url, role FROM users WHERE email = $1 OR name = $1",
     [identifier]
   );
 

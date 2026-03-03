@@ -12,7 +12,7 @@ import { redis } from "../src/config/redis.js";
 import fs from "fs/promises";
 import path from "path";
 import { parseChatBody } from "../utils/chatMessageFormat.js";
-import { getIO, getSocketPresenceSnapshot } from "../socket.js";
+import { getCallAnomaliesSnapshot, getIO, getSocketPresenceSnapshot } from "../socket.js";
 import { normalizeDbTimestampToIso } from "../utils/time.js";
 
 const SESSION_TTL_SECONDS = 7 * 24 * 60 * 60;
@@ -75,6 +75,36 @@ async function getSessionUserFromRequest(req) {
   } catch {
     return null;
   }
+}
+
+async function refreshSessionUser(req, patch = {}) {
+  const sessionId = req.cookies.sessionId;
+  if (!sessionId) return null;
+
+  const key = `session:${sessionId}`;
+  const current = await redis.get(key);
+  if (!current) return null;
+
+  let parsed;
+  try {
+    parsed = JSON.parse(current);
+  } catch {
+    return null;
+  }
+
+  const updated = {
+    ...parsed,
+    ...patch,
+  };
+
+  const ttl = await redis.ttl(key);
+  const expiresIn = Number(ttl) > 0 ? Number(ttl) : SESSION_TTL_SECONDS;
+
+  await redis.set(key, JSON.stringify(updated), {
+    EX: expiresIn,
+  });
+
+  return updated;
 }
 
 async function requireAdminSession(req, res) {
@@ -201,6 +231,12 @@ export const updateUserByAdmin = async (req, res) => {
       values.push(normalizedRole);
     }
 
+    if (typeof req.body?.profile_image_url === "string") {
+      const normalizedProfileImageUrl = req.body.profile_image_url.trim() || null;
+      updates.push(`profile_image_url = $${paramIndex++}`);
+      values.push(normalizedProfileImageUrl);
+    }
+
     if (typeof password === "string" && password.length > 0) {
       const hashedPassword = await bcrypt.hash(password, 10);
       updates.push(`password = $${paramIndex++}`);
@@ -218,7 +254,7 @@ export const updateUserByAdmin = async (req, res) => {
         UPDATE users
         SET ${updates.join(", ")}
         WHERE id = $${paramIndex}
-        RETURNING id, name, email, role
+        RETURNING id, name, email, role, profile_image_url
       `,
       values
     );
@@ -333,6 +369,7 @@ export async function login(req, res) {
       id: user.id,
       name: user.name,
       email: user.email,
+      profile_image_url: user.profile_image_url || null,
       role: user.role,
       sessionId,
       createdAt: new Date().toISOString(),
@@ -363,6 +400,7 @@ export async function login(req, res) {
         id: user.id,
         name: user.name,
         email: user.email,
+        profile_image_url: user.profile_image_url || null,
         role: user.role
       }
     });
@@ -526,6 +564,166 @@ export const getSessionDiagnostics = async (req, res) => {
   }
 };
 
+export const getCallAnomalyDiagnostics = async (req, res) => {
+  try {
+    const adminUser = await requireAdminSession(req, res);
+    if (!adminUser) return;
+
+    const limit = Number(req.query.limit || 100);
+    const sinceMs = Number(req.query.sinceMs || 0);
+    const severity = String(req.query.severity || "").toLowerCase();
+
+    const snapshot = getCallAnomaliesSnapshot({
+      limit,
+      sinceMs,
+      severity,
+    });
+
+    return res.json({
+      success: true,
+      requestedBy: {
+        id: adminUser.id,
+        email: adminUser.email || null,
+      },
+      ...snapshot,
+    });
+  } catch (error) {
+    console.error("Call anomaly diagnostics error:", error);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+
+export const uploadProfileImage = async (req, res) => {
+  try {
+    const sessionUser = await getSessionUserFromRequest(req);
+    if (!sessionUser?.id) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ success: false, message: "Image file is required" });
+    }
+
+    const mimeType = String(req.file.mimetype || "");
+    if (!mimeType.startsWith("image/")) {
+      return res.status(400).json({ success: false, message: "Only image upload is allowed" });
+    }
+
+    const extension = path.extname(req.file.originalname || "") || ".png";
+    const profileDir = path.join(process.cwd(), "uploads", "profiles", `user_${sessionUser.id}`);
+    await fs.mkdir(profileDir, { recursive: true });
+
+    const storedName = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}${extension}`;
+    const absoluteFilePath = path.join(profileDir, storedName);
+    await fs.writeFile(absoluteFilePath, req.file.buffer);
+
+    const relativePath = `/uploads/profiles/user_${sessionUser.id}/${storedName}`;
+
+    const result = await pool.query(
+      `
+      UPDATE users
+      SET profile_image_url = $1
+      WHERE id = $2
+      RETURNING id, name, LOWER(email) AS email, role, profile_image_url
+      `,
+      [relativePath, sessionUser.id]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    const updatedUser = result.rows[0];
+
+    await refreshSessionUser(req, {
+      name: updatedUser.name,
+      email: updatedUser.email,
+      role: updatedUser.role,
+      profile_image_url: updatedUser.profile_image_url || null,
+    });
+
+    try {
+      const io = getIO();
+      io.emit("profileImageUpdated", {
+        userId: updatedUser.id,
+        email: updatedUser.email,
+        profileImageUrl: updatedUser.profile_image_url || null,
+      });
+    } catch {
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        id: updatedUser.id,
+        name: updatedUser.name,
+        email: updatedUser.email,
+        role: updatedUser.role,
+        profile_image_url: updatedUser.profile_image_url || null,
+      },
+    });
+  } catch (error) {
+    console.error("Upload profile image error:", error);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+
+export const resetProfileImage = async (req, res) => {
+  try {
+    const sessionUser = await getSessionUserFromRequest(req);
+    if (!sessionUser?.id) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+
+    const result = await pool.query(
+      `
+      UPDATE users
+      SET profile_image_url = NULL
+      WHERE id = $1
+      RETURNING id, name, LOWER(email) AS email, role, profile_image_url
+      `,
+      [sessionUser.id]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    const updatedUser = result.rows[0];
+
+    await refreshSessionUser(req, {
+      name: updatedUser.name,
+      email: updatedUser.email,
+      role: updatedUser.role,
+      profile_image_url: null,
+    });
+
+    try {
+      const io = getIO();
+      io.emit("profileImageUpdated", {
+        userId: updatedUser.id,
+        email: updatedUser.email,
+        profileImageUrl: null,
+      });
+    } catch {
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        id: updatedUser.id,
+        name: updatedUser.name,
+        email: updatedUser.email,
+        role: updatedUser.role,
+        profile_image_url: null,
+      },
+    });
+  } catch (error) {
+    console.error("Reset profile image error:", error);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+
 export const getChatHistory = async (req, res) => {
   try {
     const sessionUser = await getSessionUserFromRequest(req);
@@ -673,6 +871,7 @@ export const getChatSuggestions = async (req, res) => {
         u.id,
         u.name,
         LOWER(u.email) AS email,
+        u.profile_image_url,
         (
           u.is_online IS NOT NULL
           AND u.is_online >= ((NOW() AT TIME ZONE 'UTC') - INTERVAL '40 seconds')

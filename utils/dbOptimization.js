@@ -16,7 +16,16 @@ const INDEX_STATEMENTS = [
    ON users (is_online)`,
 ];
 
+const SCHEMA_STATEMENTS = [
+  `ALTER TABLE users
+   ADD COLUMN IF NOT EXISTS profile_image_url TEXT`,
+];
+
 export async function ensureDatabaseOptimizations() {
+  for (const statement of SCHEMA_STATEMENTS) {
+    await pool.query(statement);
+  }
+
   for (const statement of INDEX_STATEMENTS) {
     await pool.query(statement);
   }

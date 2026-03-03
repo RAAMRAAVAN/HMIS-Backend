@@ -13,7 +13,9 @@ const lastPresenceWriteByUser = new Map();
 const activeCallByUser = new Map();
 const participantsByCallId = new Map();
 const callMetaByCallId = new Map();
+const callAnomalies = [];
 const PRESENCE_WRITE_THROTTLE_MS = 15_000;
+const MAX_CALL_ANOMALIES = 500;
 
 function hasActiveSocketForUser(userId) {
   for (const connectedUser of connectedUsers.values()) {
@@ -40,6 +42,29 @@ function shouldWritePresence(userId) {
 
 function normalizeIdentifier(value) {
   return String(value || "").toLowerCase().trim();
+}
+
+function trackCallAnomaly(payload = {}, fallback = {}) {
+  const entry = {
+    source: String(payload.source || fallback.source || "unknown"),
+    code: String(payload.code || "unspecified"),
+    message: String(payload.message || "Call anomaly"),
+    severity: payload.severity === "error" ? "error" : "warn",
+    from: normalizeIdentifier(payload.from || fallback.from || ""),
+    contact: normalizeIdentifier(payload.contact || ""),
+    callId: String(payload.callId || fallback.callId || "").trim() || null,
+    details: payload.details && typeof payload.details === "object" ? payload.details : null,
+    socketId: String(fallback.socketId || "") || null,
+    createdAt: new Date().toISOString(),
+  };
+
+  callAnomalies.unshift(entry);
+  if (callAnomalies.length > MAX_CALL_ANOMALIES) {
+    callAnomalies.length = MAX_CALL_ANOMALIES;
+  }
+
+  const logger = entry.severity === "error" ? console.error : console.warn;
+  logger("[CallAnomaly]", entry);
 }
 
 function getSocketIdsForUser(userId) {
@@ -250,6 +275,37 @@ export function getSocketPresenceSnapshot() {
   return {
     totalSockets: connectedUsers.size,
     users: Array.from(counts.values()).sort((a, b) => b.connectionCount - a.connectionCount),
+  };
+}
+
+export function getCallAnomaliesSnapshot({ limit = 100, severity = "", sinceMs = 0 } = {}) {
+  const safeLimit = Math.min(Math.max(Number(limit) || 100, 1), MAX_CALL_ANOMALIES);
+  const normalizedSeverity = String(severity || "").toLowerCase();
+  const validSeverity = normalizedSeverity === "error" || normalizedSeverity === "warn" ? normalizedSeverity : "";
+  const thresholdMs = Math.max(0, Number(sinceMs) || 0);
+
+  const data = [];
+  for (const item of callAnomalies) {
+    if (validSeverity && item.severity !== validSeverity) continue;
+    if (thresholdMs > 0 && Date.parse(item.createdAt) < thresholdMs) continue;
+
+    data.push({
+      ...item,
+      details: item.details ? { ...item.details } : null,
+    });
+
+    if (data.length >= safeLimit) break;
+  }
+
+  return {
+    totalTracked: callAnomalies.length,
+    returned: data.length,
+    filters: {
+      limit: safeLimit,
+      severity: validSeverity || null,
+      sinceMs: thresholdMs || null,
+    },
+    data,
   };
 }
 
@@ -633,7 +689,7 @@ export function initSocket(httpServer) {
       };
 
       const endedAtIso = new Date().toISOString();
-      const eventType = meta.answeredAt ? "declined" : "missed";
+      const eventType = "declined";
 
       persistCallEventForBothParticipants({
         callId,
@@ -730,6 +786,15 @@ export function initSocket(httpServer) {
         micEnabled: payload.micEnabled !== false,
         cameraEnabled: payload.cameraEnabled !== false,
         createdAt: Date.now(),
+      });
+    });
+
+    socket.on("call:anomaly", (payload = {}) => {
+      const registeredUser = normalizeIdentifier(connectedUsers.get(socket.id));
+      trackCallAnomaly(payload, {
+        source: "frontend",
+        from: registeredUser,
+        socketId: socket.id,
       });
     });
 
